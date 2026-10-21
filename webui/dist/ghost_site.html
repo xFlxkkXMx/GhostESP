@@ -1667,6 +1667,8 @@ const state = {
   actionTarget: 'local',
   selectedIndices: new Set(),
   terminalTimer: null,
+  wsSocket: null,
+  wsRetryMs: 1000,
   commandHistory: [],
   historyIndex: -1,
   commHistory: [],
@@ -1697,6 +1699,38 @@ const pages = [
 /* ======================== UTILITIES ======================== */
 function $(id) { return document.getElementById(id); }
 function api(path, options) { return fetch(path, options); }
+
+/* ======================== WEBSOCKET ======================== */
+// Live log stream replaces the /api/logs polling when connected; commands are
+// sent over the same socket. Falls back to HTTP polling/POST when down.
+function wsOpen() { return state.wsSocket && state.wsSocket.readyState === WebSocket.OPEN; }
+
+function connectLogsSocket() {
+  if (state.wsSocket) return;
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + '/ws');
+  state.wsSocket = ws;
+  ws.onopen = () => {
+    state.wsRetryMs = 1000;
+    // Resync in case output was produced while the socket was down.
+    refreshLogs(true).catch(() => {});
+  };
+  ws.onmessage = (event) => handleWsLogMessage(event.data);
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  ws.onclose = () => {
+    state.wsSocket = null;
+    setTimeout(connectLogsSocket, state.wsRetryMs);
+    state.wsRetryMs = Math.min(state.wsRetryMs * 5, 30000);
+  };
+}
+
+function handleWsLogMessage(text) {
+  if (typeof text !== 'string' || !text) return;
+  state.logs = (state.logs || '') + text;
+  invalidateParseCache();
+  renderLogs();
+  renderActiveFeatureView();
+}
 
 function esc(str) { return String(str || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function escapeAttr(str) { return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;'); }
@@ -3122,8 +3156,12 @@ async function runCommand(command, options = {}) {
     appendTerminal('> ' + command + '\n');
   }
   try {
-    const res = await api('/api/command', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ command }) });
-    if (!res.ok) throw new Error(await res.text() || 'command failed');
+    if (wsOpen()) {
+      state.wsSocket.send(command);
+    } else {
+      const res = await api('/api/command', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ command }) });
+      if (!res.ok) throw new Error(await res.text() || 'command failed');
+    }
     if (!options.silent) {
       toast('Command sent', 'good');
       setTimeout(() => refreshLogs(true), 900);
@@ -3667,10 +3705,14 @@ function init() {
     startReconnectWatch();
   });
   state.terminalTimer = setInterval(() => {
-    refreshLogs(false).then(pollPeerResponses).catch(() => {});
+    if (!wsOpen()) {
+      refreshLogs(false).catch(() => {});
+    }
+    pollPeerResponses();
     if (document.querySelector('#page-dashboard.active')) renderDashboard();
     populateDashboardIfStale();
   }, 2000);
+  connectLogsSocket();
   setInterval(() => loadCommStatus().catch(() => {}), 1500);
 }
 

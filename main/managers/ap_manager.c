@@ -78,6 +78,9 @@ static esp_err_t api_logs_handler(httpd_req_t *req);
 static esp_err_t api_esp_comm_status_handler(httpd_req_t *req);
 static esp_err_t api_esp_comm_control_handler(httpd_req_t *req);
 static esp_err_t api_esp_comm_send_handler(httpd_req_t *req);
+#if CONFIG_HTTPD_WS_SUPPORT
+static esp_err_t ws_handler(httpd_req_t *req);
+#endif
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
                           void *event_data);
@@ -1093,8 +1096,167 @@ void ap_manager_deinit(void) {
     ESP_LOGI(TAG, "AP Manager deinitialized successfully");
 }
 
+#if CONFIG_HTTPD_WS_SUPPORT
+#define WS_MAX_CLIENTS 4
+
+static int ws_client_fds[WS_MAX_CLIENTS] = { -1, -1, -1, -1 };
+static SemaphoreHandle_t ws_clients_mutex = NULL;
+
+static void ws_clients_lock(void) {
+    if (!ws_clients_mutex) {
+        static portMUX_TYPE init_mux = portMUX_INITIALIZER_UNLOCKED;
+        SemaphoreHandle_t new_mutex = xSemaphoreCreateMutex();
+        portENTER_CRITICAL(&init_mux);
+        if (!ws_clients_mutex) {
+            ws_clients_mutex = new_mutex;
+            new_mutex = NULL;
+        }
+        portEXIT_CRITICAL(&init_mux);
+        if (new_mutex) vSemaphoreDelete(new_mutex);
+    }
+    if (ws_clients_mutex) xSemaphoreTake(ws_clients_mutex, portMAX_DELAY);
+}
+
+static void ws_clients_unlock(void) {
+    if (ws_clients_mutex) xSemaphoreGive(ws_clients_mutex);
+}
+
+static bool ws_client_add(int fd) {
+    bool added = false;
+    ws_clients_lock();
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (ws_client_fds[i] == fd) {
+            added = true;
+            break;
+        }
+        if (ws_client_fds[i] < 0) {
+            ws_client_fds[i] = fd;
+            added = true;
+            break;
+        }
+    }
+    ws_clients_unlock();
+    return added;
+}
+
+static void ws_client_remove(int fd) {
+    ws_clients_lock();
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (ws_client_fds[i] == fd) {
+            ws_client_fds[i] = -1;
+        }
+    }
+    ws_clients_unlock();
+}
+
+static void ws_clients_clear(void) {
+    ws_clients_lock();
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        ws_client_fds[i] = -1;
+    }
+    ws_clients_unlock();
+}
+
+// Broadcast a text frame to every connected /ws client. Safe to call from any
+// task (glog runs on several), so it only uses the async frame sender and
+// never blocks on a socket.
+static void ws_broadcast_text(const char *text) {
+    if (!server || !text || !text[0]) return;
+
+    int fds[WS_MAX_CLIENTS];
+    int count = 0;
+    ws_clients_lock();
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (ws_client_fds[i] >= 0) fds[count++] = ws_client_fds[i];
+    }
+    ws_clients_unlock();
+    if (!count) return;
+
+    httpd_ws_frame_t frame = {
+        .final = true,
+        .fragmented = false,
+        .type = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)text,
+        .len = strlen(text),
+    };
+    for (int i = 0; i < count; i++) {
+        esp_err_t err = httpd_ws_send_frame_async(server, fds[i], &frame);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WS send to fd %d failed: %s; dropping client", fds[i], esp_err_to_name(err));
+            ws_client_remove(fds[i]);
+        }
+    }
+}
+
+static esp_err_t ws_handler(httpd_req_t *req) {
+    WEBUI_GUARD_OR_RETURN(req);
+
+    int fd = httpd_req_to_sockfd(req);
+    if (req->method == HTTP_GET) {
+        // WebSocket handshake: track the client so logs can be broadcast to it.
+        if (fd < 0 || !ws_client_add(fd)) {
+            ESP_LOGW(TAG, "Rejecting WS client (fd %d, max %d clients)", fd, WS_MAX_CLIENTS);
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            return httpd_resp_sendstr(req, "WS client limit reached");
+        }
+        ESP_LOGI(TAG, "WS client connected (fd %d)", fd);
+        return ESP_OK;
+    }
+
+    char command[256];
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.payload = (uint8_t *)command;
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(command) - 1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WS frame receive failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ws_client_remove(fd);
+        ESP_LOGI(TAG, "WS client disconnected (fd %d)", fd);
+        return ESP_OK;
+    }
+
+    if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
+        httpd_ws_frame_t pong = {
+            .final = true,
+            .fragmented = false,
+            .type = HTTPD_WS_TYPE_PONG,
+            .payload = ws_pkt.payload,
+            .len = ws_pkt.len,
+        };
+        return httpd_ws_send_frame(req, &pong);
+    }
+
+    if (ws_pkt.type != HTTPD_WS_TYPE_TEXT) {
+        return ESP_OK;
+    }
+
+    // Same limits as POST /api/command: one command of 1-255 bytes, no newlines.
+    if (ws_pkt.len == 0) {
+        return ESP_OK;
+    }
+    command[ws_pkt.len] = '\0';
+    if (!command[0] || strchr(command, '\n') || strchr(command, '\r')) {
+        return ESP_OK;
+    }
+
+    char cmd_log[1024];
+    snprintf(cmd_log, sizeof(cmd_log), "> %s\n", command);
+    ap_manager_add_log(cmd_log);
+
+    simulateCommand(command);
+    return ESP_OK;
+}
+#endif // CONFIG_HTTPD_WS_SUPPORT
+
 void ap_manager_add_log(const char *log_message) {
     terminal_view_add_text(log_message);
+#if CONFIG_HTTPD_WS_SUPPORT
+    ws_broadcast_text(log_message);
+#endif
 }
 
 esp_err_t ap_manager_start_services() {
@@ -2114,6 +2276,19 @@ static esp_err_t load_server_config(void) {
     ADD_URI_HANDLER("/camera/stream", HTTP_GET, camera_stream_http_handler);
     ADD_URI_HANDLER("/camera/api", HTTP_POST, camera_stream_api_handler);
 #endif
+#if CONFIG_HTTPD_WS_SUPPORT
+    if (handler_count >= (int)(sizeof(uri_handlers) / sizeof(uri_handlers[0]))) {
+        ESP_LOGE(TAG, "Too many URI handlers, cannot add: /ws");
+        return ESP_FAIL;
+    }
+    uri_handlers[handler_count++] = (httpd_uri_t){
+        .uri = "/ws",
+        .method = HTTP_GET,
+        .handler = ws_handler,
+        .user_ctx = NULL,
+        .is_websocket = true,
+    };
+#endif
 
 #undef ADD_URI_HANDLER
 
@@ -2166,6 +2341,9 @@ static esp_err_t start_http_server(void) {
 
 static esp_err_t stop_http_server(void) {
     if (server) {
+#if CONFIG_HTTPD_WS_SUPPORT
+        ws_clients_clear();
+#endif
         esp_err_t ret = httpd_stop(server);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to stop HTTP server: %s", esp_err_to_name(ret));
