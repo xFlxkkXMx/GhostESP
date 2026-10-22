@@ -42,6 +42,7 @@ jobs:
           - { name: "esp32s3-generic",         idf_target: "esp32s3", sdkconfig_file: "configs/sdkconfig.default.esp32s3",                 zip_name: "esp32s3-generic.zip" }
           - { name: "s3supermini",             idf_target: "esp32s3", sdkconfig_file: "configs/sdkconfig.s3supermini",                     zip_name: "s3supermini.zip" }
           - { name: "c6peer",                  idf_target: "esp32c6", sdkconfig_file: "configs/sdkconfig.c6peer",                          zip_name: "c6peer.zip" }
+          - { name: "s3devkit",              idf_target: "esp32s3", sdkconfig_file: "configs/sdkconfig.s3devkit",                      zip_name: "s3devkit.zip" }
           - { name: "esp32c3-generic",         idf_target: "esp32c3", sdkconfig_file: "configs/sdkconfig.default.esp32c3",                 zip_name: "esp32c3-generic.zip" }
           - { name: "esp32c5-generic",         idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.default.esp32c5",                 zip_name: "esp32c5-generic-v01.zip" }
           - { name: "esp32c6-generic",         idf_target: "esp32c6", sdkconfig_file: "configs/sdkconfig.default.esp32c6",                 zip_name: "esp32c6-generic.zip" }
